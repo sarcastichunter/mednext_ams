@@ -13,3 +13,5 @@ torchvision==0.17.0
 monai==1.3.0
 
 matplotlib
+
+einops
