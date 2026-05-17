@@ -6,9 +6,7 @@ import pandas as pd
 import nibabel as nib
 
 
-# -----------------------------------------------------------------------
 # CLI ARGUMENTI
-# -----------------------------------------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -29,9 +27,7 @@ def parse_args():
     return parser.parse_args()
 
 
-# -----------------------------------------------------------------------
 # POMOŽNE FUNKCIJE
-# -----------------------------------------------------------------------
 
 def ensure_dirs(out_dir: str):
     """Ustvari potrebne podmape za nnU-Net format."""
@@ -67,9 +63,7 @@ def load_split_info(excel_path: str, split_col: str) -> pd.DataFrame:
     return df
 
 
-# -----------------------------------------------------------------------
 # GLAVNI PROGRAM
-# -----------------------------------------------------------------------
 
 def main():
     args = parse_args()
