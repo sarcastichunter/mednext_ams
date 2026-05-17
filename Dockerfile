@@ -32,11 +32,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # nnU-Net (za baseline primerjavo)
 RUN pip install nnunetv2
 
-# Kopiranje kode
-COPY . .
-
-# Namestitev MedNeXt iz lokalnega git submodula
-RUN pip install --no-cache-dir -e mednext/
+# Namestitev MedNeXt iz GitHub
+RUN pip install git+https://github.com/MIC-DKFZ/MedNeXt.git
 
 # Privzet ukaz
 CMD ["python3", "-c", "print('MedNeXt container pripravljen.')"]
