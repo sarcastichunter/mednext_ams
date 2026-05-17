@@ -69,28 +69,39 @@ def validate_pair(img_path: str, lbl_path: str) -> bool:
 
 
 def find_available_cases(raw_dir: str):
-    """
-    Poišče vse veljavne pare (slika + maska) v raw_dir.
-    Vrne seznam ID-jev kot stringi.
-    """
+    
     available = []
-    files = os.listdir(raw_dir)
-
-    # Poišči vse .img.nii.gz datoteke
-    img_files = [f for f in files if f.endswith(".img.nii.gz")]
-
-    for img_file in img_files:
-        file_id = img_file.replace(".img.nii.gz", "")
-        lbl_file = f"{file_id}.label.nii.gz"
-
-        img_path = os.path.join(raw_dir, img_file)
-        lbl_path = os.path.join(raw_dir, lbl_file)
-
-        if os.path.exists(lbl_path):
-            available.append(file_id)
-
-    return sorted(available, key=lambda x: int(x) if x.isdigit() else x)
-
+ 
+    # Zberemo vse mape — tako raw_dir kot vse podmape
+    search_dirs = [raw_dir]
+    for entry in sorted(os.listdir(raw_dir)):
+        full_path = os.path.join(raw_dir, entry)
+        if os.path.isdir(full_path):
+            search_dirs.append(full_path)
+ 
+    print(f"  Iščem v mapah: {[os.path.basename(d) for d in search_dirs]}")
+ 
+    for search_dir in search_dirs:
+        try:
+            files = os.listdir(search_dir)
+        except PermissionError:
+            continue
+ 
+        img_files = [f for f in files if f.endswith(".img.nii.gz")]
+ 
+        for img_file in img_files:
+            file_id = img_file.replace(".img.nii.gz", "")
+            lbl_file = f"{file_id}.label.nii.gz"
+ 
+            img_path = os.path.join(search_dir, img_file)
+            lbl_path = os.path.join(search_dir, lbl_file)
+ 
+            if os.path.exists(lbl_path):
+                available.append((file_id, img_path, lbl_path))
+ 
+    # Sortiraj po file_id
+    available.sort(key=lambda x: int(x[0]) if x[0].isdigit() else x[0])
+    return available
 
 # GLAVNI PROGRAM
 
