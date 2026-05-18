@@ -67,9 +67,10 @@ class CTADatasetFullVolume(Dataset):
         image = self.load_nii(img_path)
 
         # normalize
-        image = (image - image.mean()) / (image.std() + 1e-8)
-        image = torch.from_numpy(image).unsqueeze(0)  # (1, D, H, W)
-
+        image = np.clip(image, -1000, 1000)
+        image = (image - (-1000)) / (1000 - (-1000))  # → [0.0, 1.0]
+        image = torch.from_numpy(image).unsqueeze(0)
+        
         if self.split == "test":
             return {"image": image, "case_id": case_id}
 
