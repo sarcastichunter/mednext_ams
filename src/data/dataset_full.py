@@ -66,7 +66,7 @@ class CTADatasetFullVolume(Dataset):
         img_path = os.path.join(self.image_dir, f"{case_id}_0000.nii.gz")
         image = self.load_nii(img_path)
 
-        # normalize
+        # normalize / popravek, zamenjava mean/std z HU oknom
         image = np.clip(image, -1000, 1000)
         image = (image - (-1000)) / (1000 - (-1000))  # → [0.0, 1.0]
         image = torch.from_numpy(image).unsqueeze(0)
