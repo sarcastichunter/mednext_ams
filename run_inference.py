@@ -1,158 +1,168 @@
-import os
-import shutil
-import json
 import argparse
-import pandas as pd
+import os
+
 import nibabel as nib
+import numpy as np
+import torch
+from monai.inferers import sliding_window_inference
+
+from nnunet_mednext.network_architecture.mednextv1.MedNextV1 import MedNeXt
 
 
+# -----------------------------------------------------------------------
 # CLI ARGUMENTI
+# -----------------------------------------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Pretvori ImageCAS dataset v nnU-Net v2 format."
+        description="MedNeXt inferenca: segmentacija koronarnih arterij na novih CTA slikah."
     )
-    parser.add_argument("--excel_path", type=str,
-                        default="data/archive/imageCAS_data_split.xlsx",
-                        help="Pot do Excel datoteke s split informacijo")
-    parser.add_argument("--raw_dir", type=str,
-                        default="data/imagecas_raw",
-                        help="Pot do surovih ImageCAS datotek (.img.nii.gz, .label.nii.gz)")
-    parser.add_argument("--out_dir", type=str,
-                        default="data/nnUNet_raw/Dataset001_ImageCAS",
-                        help="Izhodna pot za nnU-Net strukturo")
-    parser.add_argument("--split_col", type=str,
-                        default="Split-1",
-                        help="Ime stolpca v Excelu (Split-1, Split-2, ...)")
+    parser.add_argument("--input_path", type=str, required=True,
+                        help="Mapa z vhodnimi slikami (*_0000.nii.gz ali *.nii.gz)")
+    parser.add_argument("--model_path", type=str, required=True,
+                        help="Pot do naučenega checkpointa (.pt)")
+    parser.add_argument("--output_path", type=str, required=True,
+                        help="Mapa za shranjevanje napovedanih mask (.nii.gz)")
+    parser.add_argument("--patch_size", type=int, nargs=3, default=[128, 128, 128],
+                        metavar=("D", "H", "W"),
+                        help="Velikost patcha (privzeto: 128 128 128)")
+    parser.add_argument("--sw_overlap", type=float, default=0.5,
+                        help="Prekrivanje med patchi (0.0-1.0, privzeto: 0.5)")
+    parser.add_argument("--threshold", type=float, default=0.5,
+                        help="Prag za binarizacijo napovedi (privzeto: 0.5)")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="cuda ali cpu")
     return parser.parse_args()
 
 
-# POMOŽNE FUNKCIJE
+# -----------------------------------------------------------------------
+# PREPROCESSING
+# -----------------------------------------------------------------------
 
-def ensure_dirs(out_dir: str):
-    """Ustvari potrebne podmape za nnU-Net format."""
-    for sub in ("imagesTr", "labelsTr", "imagesTs"):
-        os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
+def preprocess(img_np: np.ndarray) -> torch.Tensor:
+    """Enak preprocessing kot med treningom — HU okno [-1000, 1000] → [0.0, 1.0]."""
+    img = img_np.astype(np.float32)
+    img = np.clip(img, -1000, 1000)
+    img = (img - (-1000)) / (1000 - (-1000))
+    tensor = torch.from_numpy(img).unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
+    return tensor
 
 
-def convert_case_id(num) -> str:
-    """Pretvori številski ID v nnU-Net format: 1 → case_0001."""
-    return f"case_{int(num):04d}"
+# -----------------------------------------------------------------------
+# NALAGANJE SLIK
+# -----------------------------------------------------------------------
+
+def find_input_files(input_path: str):
+    """Poišče vse .nii.gz datoteke v vhodni mapi."""
+    files = []
+    for fname in sorted(os.listdir(input_path)):
+        if not fname.endswith(".nii.gz"):
+            continue
+        fpath = os.path.join(input_path, fname)
+        if fname.endswith("_0000.nii.gz"):
+            case_name = fname.replace("_0000.nii.gz", "")
+        else:
+            case_name = fname.replace(".nii.gz", "")
+        files.append((case_name, fpath))
+    return files
 
 
-def validate_pair(img_path: str, lbl_path: str):
-    """
-    Preveri, ali se slika in maska ujemata v dimenzijah.
-    Ob neskladju sproži ValueError namesto samo opozorila.
-    """
-    img_shape = nib.load(img_path).shape
-    lbl_shape = nib.load(lbl_path).shape
-    if img_shape != lbl_shape:
-        raise ValueError(
-            f"Shape mismatch: {img_path} {img_shape} vs {lbl_path} {lbl_shape}"
+# -----------------------------------------------------------------------
+# INICIALIZACIJA MODELA
+# -----------------------------------------------------------------------
+
+def load_model(model_path: str, device: torch.device) -> torch.nn.Module:
+    """Inicializira MedNeXt in naloži uteži iz checkpointa."""
+    model = MedNeXt(
+        in_channels=1,
+        n_channels=32,
+        n_classes=1,
+        exp_r=[2, 3, 4, 4, 4, 4, 4, 3, 2],
+        kernel_size=3,
+        deep_supervision=False,
+        do_res=True,
+        do_res_up_down=True,
+        block_counts=[2, 2, 2, 2, 2, 2, 2, 2, 2],
+        checkpoint_style=None,
+        dim='3d',
+        grn=False,
+    )
+    checkpoint = torch.load(model_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state"])
+    model.to(device)
+    model.eval()
+    return model
+
+
+# -----------------------------------------------------------------------
+# INFERENCA NA ENI SLIKI
+# -----------------------------------------------------------------------
+
+def run_inference_single(model, img_tensor, patch_size, sw_overlap, threshold, device):
+    """Sliding window inferenca na eni sliki."""
+    img_tensor = img_tensor.to(device)
+    with torch.no_grad():
+        pred = sliding_window_inference(
+            inputs=img_tensor,
+            roi_size=patch_size,
+            sw_batch_size=1,
+            predictor=model,
+            overlap=sw_overlap,
+            mode="gaussian",
         )
+        pred = torch.sigmoid(pred)
+    pred_np = pred[0, 0].cpu().numpy()
+    binary_mask = (pred_np > threshold).astype(np.uint8)
+    return binary_mask
 
 
-def load_split_info(excel_path: str, split_col: str) -> pd.DataFrame:
-    """Prebere Excel in vrne DataFrame s stolpcema FileName in izbranim splitom."""
-    df = pd.read_excel(excel_path, header=1)
-    if split_col not in df.columns:
-        raise ValueError(f"Stolpec '{split_col}' ni najden v Excelu. Dostopni stolpci: {list(df.columns)}")
-    df = df[["FileName", split_col]].copy()
-    df["FileName"] = df["FileName"].astype(str)
-    return df
-
-
+# -----------------------------------------------------------------------
 # GLAVNI PROGRAM
+# -----------------------------------------------------------------------
 
 def main():
     args = parse_args()
 
-    print(f"Berem split info iz: {args.excel_path} (stolpec: {args.split_col})")
-    df = load_split_info(args.excel_path, args.split_col)
+    device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("  [WARN] CUDA ni na voljo, preklapljam na CPU.")
 
-    print(f"Ustvarjam nnU-Net strukturo v: {args.out_dir}")
-    ensure_dirs(args.out_dir)
+    os.makedirs(args.output_path, exist_ok=True)
+    patch_size = tuple(args.patch_size)
 
-    train_cases, val_cases, test_cases = [], [], []
-    skipped = 0
+    print(f"Nalaganje modela iz: {args.model_path}")
+    model = load_model(args.model_path, device)
 
-    for idx, row in df.iterrows():
-        # Indeks vrstice (+1) določa ime datoteke — FileName v Excelu se ne ujema z imenom datoteke
-        file_id = str(idx + 1)
+    input_files = find_input_files(args.input_path)
+    if not input_files:
+        print(f"  [ERROR] Nobene .nii.gz datoteke v: {args.input_path}")
+        return
 
-        img_path = os.path.join(args.raw_dir, f"{file_id}.img.nii.gz")
-        lbl_path = os.path.join(args.raw_dir, f"{file_id}.label.nii.gz")
+    print(f"Najdenih {len(input_files)} slik. Začenjam inferenco...\n")
 
-        if not os.path.exists(img_path) or not os.path.exists(lbl_path):
-            print(f"  [SKIP] Manjkajoč par: {file_id}")
-            skipped += 1
-            continue
+    for i, (case_name, img_path) in enumerate(input_files, 1):
+        print(f"  [{i}/{len(input_files)}] {case_name}")
 
-        try:
-            validate_pair(img_path, lbl_path)
-        except ValueError as e:
-            print(f"  [SKIP] {e}")
-            skipped += 1
-            continue
+        nii_obj = nib.load(img_path)
+        img_np = nii_obj.get_fdata().astype(np.float32)
 
-        case_id = convert_case_id(file_id)
-        split = str(row[args.split_col]).strip()
+        img_tensor = preprocess(img_np)
 
-        if split in ("Training", "Val"):
-            dst_img = os.path.join(args.out_dir, "imagesTr", f"{case_id}_0000.nii.gz")
-            dst_lbl = os.path.join(args.out_dir, "labelsTr", f"{case_id}.nii.gz")
-            shutil.copy(img_path, dst_img)
-            shutil.copy(lbl_path, dst_lbl)
-            (train_cases if split == "Training" else val_cases).append(case_id)
+        binary_mask = run_inference_single(
+            model=model,
+            img_tensor=img_tensor,
+            patch_size=patch_size,
+            sw_overlap=args.sw_overlap,
+            threshold=args.threshold,
+            device=device,
+        )
 
-        elif split == "Testing":
-            dst_img = os.path.join(args.out_dir, "imagesTs", f"{case_id}_0000.nii.gz")
-            shutil.copy(img_path, dst_img)
-            test_cases.append(case_id)
+        out_nii = nib.Nifti1Image(binary_mask, affine=nii_obj.affine, header=nii_obj.header)
+        out_path = os.path.join(args.output_path, f"{case_name}.nii.gz")
+        nib.save(out_nii, out_path)
+        print(f"    -> Shranjeno: {out_path}")
 
-        else:
-            print(f"  [WARN] Neznan split label '{split}' za case {file_id}, preskakujem.")
-            skipped += 1
-
-    # --- dataset.json ---
-    dataset_json = {
-        "name": "ImageCAS",
-        "description": "CTA dataset converted to nnU-Net format",
-        "tensorImageSize": "3D",
-        "modality": {"0": "CT"},
-        "labels": {"0": "background", "1": "coronary_artery"},  # popravek: bil "aneurysm"
-        "numTraining": len(train_cases) + len(val_cases),
-        "numTest": len(test_cases),
-        "training": [
-            {"image": f"./imagesTr/{cid}_0000.nii.gz", "label": f"./labelsTr/{cid}.nii.gz"}
-            for cid in train_cases + val_cases
-        ],
-        "test": [
-            f"./imagesTs/{cid}_0000.nii.gz"
-            for cid in test_cases
-        ],
-    }
-
-    dataset_json_path = os.path.join(args.out_dir, "dataset.json")
-    with open(dataset_json_path, "w") as f:
-        json.dump(dataset_json, f, indent=4)
-    print(f"Shranjeno: {dataset_json_path}")
-
-    # --- splits_final.json ---
-    splits = [{"train": train_cases, "val": val_cases}]
-
-    splits_path = os.path.join(args.out_dir, "splits_final.json")
-    with open(splits_path, "w") as f:
-        json.dump(splits, f, indent=4)
-    print(f"Shranjeno: {splits_path}")
-
-    print("\n--- Povzetek ---")
-    print(f"  Training:  {len(train_cases)}")
-    print(f"  Val:       {len(val_cases)}")
-    print(f"  Testing:   {len(test_cases)}")
-    print(f"  Preskočeni: {skipped}")
-    print("Konverzija končana.")
+    print(f"\nInferenca končana. Napovedi shranjene v: {args.output_path}")
 
 
 if __name__ == "__main__":
