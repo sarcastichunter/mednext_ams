@@ -3,13 +3,12 @@ import json
 import os
 import torch
 import numpy as np
-from torch.utils.data import DataLoader
+import nibabel as nib
 from skimage.morphology import skeletonize, dilation, ball
 from monai.metrics import DiceMetric, HausdorffDistanceMetric
 from monai.inferers import sliding_window_inference
 
 from nnunet_mednext.network_architecture.mednextv1.MedNextV1 import MedNeXt
-from src.data.dataset_full import CTADatasetFullVolume
 
 
 # -----------------------------------------------------------------------
@@ -36,8 +35,59 @@ def compute_topology_metrics(pred_cl, ref_cl, radius=2):
     quality = (completeness * correctness) / (
         completeness + correctness - completeness * correctness + 1e-8
     )
-
     return completeness, correctness, quality
+
+
+# -----------------------------------------------------------------------
+# POMOŽNE FUNKCIJE
+# -----------------------------------------------------------------------
+
+def load_nii(path: str) -> np.ndarray:
+    return nib.load(path).get_fdata().astype(np.float32)
+
+
+def preprocess(img_np: np.ndarray) -> torch.Tensor:
+    """HU okno [-1000, 1000] → [0.0, 1.0] — enako kot med treningom."""
+    img = np.clip(img_np, -1000, 1000)
+    img = (img - (-1000)) / (1000 - (-1000))
+    return torch.from_numpy(img).float().unsqueeze(0).unsqueeze(0)
+
+
+def find_label_in_raw(file_id: str, raw_dir: str) -> str:
+    """
+    Poišče ground truth masko v surovih podatkih.
+    Preišče vse podmape (1-200, 201-400, ...).
+    """
+    search_dirs = [raw_dir]
+    for entry in sorted(os.listdir(raw_dir)):
+        full_path = os.path.join(raw_dir, entry)
+        if os.path.isdir(full_path):
+            search_dirs.append(full_path)
+
+    for search_dir in search_dirs:
+        lbl_path = os.path.join(search_dir, f"{file_id}.label.nii.gz")
+        if os.path.exists(lbl_path):
+            return lbl_path
+    return None
+
+
+def find_image_in_raw(file_id: str, raw_dir: str) -> str:
+    """Poišče originalno CTA sliko v surovih podatkih."""
+    search_dirs = [raw_dir]
+    for entry in sorted(os.listdir(raw_dir)):
+        full_path = os.path.join(raw_dir, entry)
+        if os.path.isdir(full_path):
+            search_dirs.append(full_path)
+
+    for search_dir in search_dirs:
+        img_path = os.path.join(search_dir, f"{file_id}.img.nii.gz")
+        if os.path.exists(img_path):
+            return img_path
+    return None
+
+
+def to_monai_tensor(mask_np: np.ndarray) -> torch.Tensor:
+    return torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0)
 
 
 # -----------------------------------------------------------------------
@@ -49,12 +99,11 @@ def main():
     parser.add_argument("--model_path",  type=str, required=True,
                         help="Pot do shranjenega checkpointa (.pt)")
     parser.add_argument("--data_path",   type=str, required=True,
-                        help="Pot do nnU-Net dataset direktorija")
+                        help="Pot do nnU-Net dataset direktorija (vsebuje imagesTs/)")
+    parser.add_argument("--raw_dir",     type=str, required=True,
+                        help="Pot do surovih ImageCAS podatkov (vsebuje podmape 1-200, 201-400 ...)")
     parser.add_argument("--output_path", type=str, required=True,
                         help="Pot za shranjevanje metrik (JSON datoteka)")
-    parser.add_argument("--split",       type=str, default="val",
-                        choices=["train", "val", "test"],
-                        help="Kateri split evalvirati (privzeto: val)")
     parser.add_argument("--patch_size",  type=int, nargs=3, default=[128, 128, 128],
                         metavar=("D", "H", "W"),
                         help="Velikost patcha za sliding window (privzeto: 128 128 128)")
@@ -64,13 +113,20 @@ def main():
                         help="cuda ali cpu")
     args = parser.parse_args()
 
-    device = args.device if torch.cuda.is_available() else "cpu"
+    device     = args.device if torch.cuda.is_available() else "cpu"
     patch_size = tuple(args.patch_size)
 
-    print(f"Nalaganje dataseta (split={args.split})...")
-    dataset = CTADatasetFullVolume(root=args.data_path, split=args.split)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
+    # Poišči vse testne primere v imagesTs/
+    images_ts_dir = os.path.join(args.data_path, "imagesTs")
+    test_files    = sorted([f for f in os.listdir(images_ts_dir) if f.endswith("_0000.nii.gz")])
 
+    if not test_files:
+        print(f"[ERROR] Nobenih datotek v {images_ts_dir}")
+        return
+
+    print(f"Najdenih {len(test_files)} testnih primerov.")
+
+    # Naloži model
     print(f"Nalaganje modela iz: {args.model_path}")
     checkpoint = torch.load(args.model_path, map_location=device)
 
@@ -88,52 +144,69 @@ def main():
         dim='3d',
         grn=False,
     )
-
     model.load_state_dict(checkpoint["model_state"])
     model.to(device)
     model.eval()
 
-    # MONAI metrike
     dice_metric = DiceMetric(include_background=False, reduction="none")
     hd95_metric = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="none")
 
     all_C, all_K, all_Q = [], [], []
     n_hd95_skipped = 0
+    skipped = 0
 
-    print(f"Evalvacija s sliding window (patch={patch_size}, overlap={args.sw_overlap})...")
+    print(f"Evalvacija s sliding window (patch={patch_size}, overlap={args.sw_overlap})...\n")
+
     with torch.no_grad():
-        for batch in dataloader:
-            img            = batch["image"].to(device)
-            ref_mask_tensor = batch["mask"][0, 0].cpu().numpy()
+        for i, fname in enumerate(test_files, 1):
+            case_id = fname.replace("_0000.nii.gz", "")
+            file_id = str(int(case_id.replace("case_", "")))
 
-            # Sliding window inferenca — reši OOM problem
+            print(f"  [{i}/{len(test_files)}] {case_id}")
+
+            # Poišči ground truth masko v surovih podatkih
+            lbl_path = find_label_in_raw(file_id, args.raw_dir)
+            if lbl_path is None:
+                print(f"    [SKIP] Ground truth ni najden za file_id={file_id}")
+                skipped += 1
+                continue
+
+            # Naloži sliko iz imagesTs
+            img_path = os.path.join(images_ts_dir, fname)
+            img_np   = load_nii(img_path)
+            img_t    = preprocess(img_np).to(device)
+
+            # Naloži ground truth masko
+            lbl_np = (load_nii(lbl_path) > 0).astype(np.uint8)
+
+            # Sliding window inferenca
             pred_logits = sliding_window_inference(
-                inputs=img,
+                inputs=img_t,
                 roi_size=patch_size,
                 sw_batch_size=1,
                 predictor=model,
                 overlap=args.sw_overlap,
                 mode="gaussian",
             )
-
             pred_binary = (torch.sigmoid(pred_logits) > 0.5).float()
-            ref_binary  = batch["mask"].to(device)
+            pred_np     = pred_binary[0, 0].cpu().numpy()
 
-            # Dice
-            dice_metric(y_pred=pred_binary, y=ref_binary)
+            # MONAI metrike
+            pred_t  = to_monai_tensor(pred_np)
+            label_t = to_monai_tensor(lbl_np)
 
-            # HD95
-            if pred_binary.sum() > 0 and ref_binary.sum() > 0:
-                hd95_metric(y_pred=pred_binary, y=ref_binary)
+            dice_metric(y_pred=pred_t, y=label_t)
+
+            if pred_np.sum() > 0 and lbl_np.sum() > 0:
+                hd95_metric(y_pred=pred_t, y=label_t)
             else:
                 n_hd95_skipped += 1
 
-            # Topološke metrike na CPU
-            pred_np = pred_binary[0, 0].cpu().numpy()
-            pred_cl = extract_centerline(pred_np)
-            ref_cl  = extract_centerline(ref_mask_tensor)
+            # Topološke metrike
+            pred_cl  = extract_centerline(pred_np)
+            ref_cl   = extract_centerline(lbl_np)
+            C, K, Q  = compute_topology_metrics(pred_cl, ref_cl)
 
-            C, K, Q = compute_topology_metrics(pred_cl, ref_cl)
             all_C.append(float(C))
             all_K.append(float(K))
             all_Q.append(float(Q))
@@ -153,6 +226,7 @@ def main():
         "quality":      float(np.mean(all_Q)),
         "n_evaluated":  len(dice_scores),
         "n_hd95_valid": int(len(hd95_valid)),
+        "n_skipped":    skipped,
     }
 
     print("\n--- Rezultati ---")
