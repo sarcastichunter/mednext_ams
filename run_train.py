@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 
 from src.data.dataset_nnunet import get_dataloaders
-from mednext.nnunet_mednext.network_architecture.mednextv1.MedNextV1 import MedNeXt
+from nnunet_mednext.network_architecture.mednextv1.MedNextV1 import MedNeXt
 from src.trening.train_loop import Trainer
 
 

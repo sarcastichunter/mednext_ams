@@ -118,20 +118,12 @@ def main():
     dataset_json = {
         "name": "ImageCAS",
         "description": "CTA dataset converted to nnU-Net format",
-        "tensorImageSize": "3D",
-        "modality": {"0": "CT"},
-        "labels": {"0": "background", "1": "coronary_artery"},  # popravek: bil "aneurysm"
+        "channel_names": {"0": "CT"},
+        "labels": {"background": 0, "coronary_artery": 1},
         "numTraining": len(train_cases) + len(val_cases),
-        "numTest": len(test_cases),
-        "training": [
-            {"image": f"./imagesTr/{cid}_0000.nii.gz", "label": f"./labelsTr/{cid}.nii.gz"}
-            for cid in train_cases + val_cases
-        ],
-        "test": [
-            f"./imagesTs/{cid}_0000.nii.gz"
-            for cid in test_cases
-        ],
+        "file_ending": ".nii.gz",
     }
+
 
     dataset_json_path = os.path.join(args.out_dir, "dataset.json")
     with open(dataset_json_path, "w") as f:
