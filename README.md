@@ -10,6 +10,7 @@ V tej implementaciji je uporabljena 9-stopenjska MedNeXt arhitektura (`exp_r=[2,
 
 ## Struktura repozitorija
 
+```
 .
 ├── Dockerfile
 ├── requirements.txt
@@ -19,16 +20,17 @@ V tej implementaciji je uporabljena 9-stopenjska MedNeXt arhitektura (`exp_r=[2,
 ├── run_inference.py                      ← CLI inferenca na novih slikah
 ├── scripts/
 │   ├── convert_imagecas_to_nnunet.py     ← pretvorba ImageCAS → nnU-Net (uradni Excel split)
-│   ├── convert_imagecas_to_nnunet_n_samples.py  ← pretvorba poljubnega N primerov (train/val/test ratio)
-│   ├── eval_nnunet.py                    ← evalvacija napovedi (MedNeXt ali nnU-Net) glede na surove podatke
-│   └── vizualizacija.py                  ← kvalitativna primerjava (CTA + ground truth + napoved)
+│   ├── convert_imagecas_to_nnunet_n_samples.py  ← pretvorba poljubnega N primerov
+│   ├── eval_nnunet.py                    ← evalvacija napovedi glede na surove podatke
+│   └── vizualizacija.py                  ← kvalitativna primerjava (CTA + GT + napoved)
 ├── src/
 │   ├── data/
 │   │   ├── dataset_full.py               ← full-volume dataloader (za run_test.py)
-│   │   └── dataset_nnunet.py             ← patch dataloader z MONAI augmentacijami (za run_train.py)
+│   │   └── dataset_nnunet.py             ← patch dataloader z MONAI augmentacijami
 │   └── trening/
 │       └── train_loop.py                 ← Trainer razred (mixed precision, checkpointing)
 └── run_all_folds.sh                      ← zagon treninga in evalvacije na vseh 4 foldih
+```
 
 Opomba: MedNeXt arhitektura (`nnunet_mednext`) se namesti direktno iz uradnega GitHub repozitorija znotraj Dockerfile-a in ni del tega repozitorija.
 
